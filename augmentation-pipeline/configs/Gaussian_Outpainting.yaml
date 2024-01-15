@@ -1,0 +1,19 @@
+data:
+  name: PASCAL VOC 
+  image_path: ./Datasets/VOC/images/train2012
+  label_path: ./Datasets/VOC/labels/train2012
+  save_path: ./Datasets/VOC/SYN_train2012
+  ext: txt 
+
+measurement:
+  operator:
+    name: inpainting
+  mask_opt:
+    mask_type: outpainting 
+    mask_param:
+      method: gaussian
+      distribution: !!python/tuple [0, 0.4]  # Mu and Sigma
+      margin: !!python/tuple [16,16] # Width and Height Margin 
+  noise:
+    name: gaussian
+    sigma: 0.05

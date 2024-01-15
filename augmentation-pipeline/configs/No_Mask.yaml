@@ -1,0 +1,19 @@
+data:
+  name: PASCAL VOC 
+  image_path: ./Datasets/Pascal_VOC/VOC2012/JPEGImages
+  label_path: ./Datasets/Pascal_VOC/VOC2012/Annotations
+  save_path: ./Datasets/Pascal_VOC/SYN_VOC2012/Random
+  ext: xml
+
+measurement:
+  operator:
+    name: inpainting
+  mask_opt:
+    mask_type: inpainting 
+    mask_param:
+      method: random 
+      distribution: !!python/tuple [0, 0]  # Upper and Lower bounds probability
+      margin: !!python/tuple [16,16] # Width and Height Margin 
+  noise:
+    name: gaussian
+    sigma: 0.05

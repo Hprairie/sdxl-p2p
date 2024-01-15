@@ -1,0 +1,19 @@
+data:
+  name: PASCAL VOC 
+  image_path: ./Dataset/Baseline/images
+  label_path: ./Dataset/Baseline/labels
+  save_path: ./Dataset/Synthetic/
+  ext: txt 
+
+measurement:
+  operator:
+    name: inpainting
+  mask_opt:
+    mask_type: outpainting 
+    mask_param:
+      method: random 
+      distribution: !!python/tuple [1, 1]  # Upper and Lower bounds probability
+      margin: !!python/tuple [16,16] # Width and Height Margin 
+  noise:
+    name: gaussian
+    sigma: 0.05
