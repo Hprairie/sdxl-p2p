@@ -1404,7 +1404,7 @@ for image in images:
     save_synthetic_samples_txt(samples, mask_gen.get_mask_info(), image, data_config, False, 'context')
 
     # images['images'][1].save(f'./{category}_{item}_gamma_{gamma}_omega_{omega}.png')
-
+"""
     clip_score_fn = partial(clip_score, model_name_or_path="openai/clip-vit-base-patch16")
     sd_clip_score = calculate_clip_score(np.array(image_rec), prompts[1])
     print(f"CLIP score: {sd_clip_score}")
@@ -1441,4 +1441,4 @@ for image in images:
 
     torch.cuda.empty_cache() 
     base_count += 1
-
+"""
