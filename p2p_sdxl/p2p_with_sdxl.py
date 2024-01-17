@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from diffusers.models.attention import Attention
 import torch
 import sys
+import copy
 
 sys.path.append('../diffusion-posterior-sampling/')
 sys.path.append('../augmentation-pipeline/')
@@ -47,12 +48,14 @@ measure_config = task_config['measurement']
 operator = get_operator(device=device, **measure_config['operator'])
 noiser = get_noise(**measure_config['noise'])
 
+'''
 new_sd = StableDiffusionXLPipeline.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0",
                                             torch_dtype=TYPE_, 
                                             use_safetensors=True,
                                             # vae=new_vae,
                                             variant="fp16",
                                             ).to(device)
+'''
 
 
 """## Null Text Inversion code"""
@@ -841,6 +844,7 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         ip_mask=None,
         gamma=0,
         omega=0,
+        uncond_emb=None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -918,7 +922,6 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         with torch.no_grad():
             self.scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False,
                                   set_alpha_to_one=False)
-
             # 0. Default height and width to unet
             height = height or self.unet.config.sample_size * self.vae_scale_factor
             width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -950,7 +953,7 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                 pooled_prompt_embeds,
                 negative_pooled_prompt_embeds,
             )
-
+                       
             # 2. Define call parameters
             if prompt is not None and isinstance(prompt, str):
                 batch_size = 1
@@ -996,10 +999,8 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             # 5. Prepare latent variables
             num_channels_latents = self.unet.config.in_channels
 
-            ddim_latents_list = []
             if latents is not None:
-                ddim_latents_list = latents
-                latents = torch.cat([latents[-1], latents[-1]], dim=0)
+                latents = torch.cat([latents, latents], dim=0)
 
             else:
                 latents = self.prepare_latents(
@@ -1012,8 +1013,7 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                         generator,
                         latents,
                     )
-            latents[1] = latents[0]
-
+                latents[1] = latents[0]
 
             # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
             extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1034,15 +1034,16 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             else:
                 negative_add_time_ids = add_time_ids
 
+            # emb = torch.cat([emb,emb],dim=0)
             if do_classifier_free_guidance:
-                half_prompt_embeds = torch.cat([negative_prompt_embeds[:1], prompt_embeds[:1]], dim=0)
-                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-                half_add_text_embeds = torch.cat([negative_pooled_prompt_embeds[:1], add_text_embeds[:1]], dim=0)
+                # half_prompt_embeds = torch.cat([emb[:1], prompt_embeds[1:]], dim=0)
+                # prompt_embeds = torch.cat([emb, prompt_embeds], dim=0)
+                half_add_text_embeds = torch.cat([negative_pooled_prompt_embeds[1:], add_text_embeds[1:]], dim=0)
                 add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
                 add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
 
-            prompt_embeds = prompt_embeds.to(device)
-            half_prompt_embeds = half_prompt_embeds.to(device)
+            # prompt_embeds = prompt_embeds.to(device)
+            # half_prompt_embeds = half_prompt_embeds.to(device)
             add_text_embeds = add_text_embeds.to(device)
             half_add_text_embeds.to(device)
             half_add_time_ids = add_time_ids.to(device).repeat(int(batch_size * num_images_per_prompt / 2), 1)
@@ -1068,12 +1069,18 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 with torch.no_grad():
+                    z_t = torch.clone(latents[1:].detach())
+
+                    half_prompt_embeds = torch.cat([uncond_emb[-1-i].to(prompt_embeds.dtype), prompt_embeds[1:]], dim=0).to(device)
+                    uncond_emb_ = torch.cat([uncond_emb[-i-1], uncond_emb[-i-1]], dim=0).to(prompt_embeds.dtype)
+                    prompt_embeds_ = torch.cat([uncond_emb_.to(device), prompt_embeds], dim=0).to(device)
+
                     # expand the latents if we are doing classifier free guidance
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                     # predict the noise residual
-                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds,
+                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds_,
                                         added_cond_kwargs=added_cond_kwargs, ).sample
 
                     # perform guidance
@@ -1086,14 +1093,20 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                         noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
                     # compute the previous noisy sample x_t -> x_t-1
-                    prev_latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
-                
+                    temp_out = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
+                    prev_latents = temp_out.prev_sample
+                    latents_0_prime = temp_out.pred_original_sample
+
+                    # step callback
+                    if p2p:
+                        prev_latents = self.controller.step_callback(prev_latents)
+
                 if inpaint:
+
                     for ind_ in range(1):
-                        z_t = torch.clone(prev_latents[1:].detach())
+                        
                         z_t.requires_grad = True
 
-                        # z_t = (ddim_latents_list[len(ddim_latents_list) - i - 1] + z_t) / 2
                         # expand the latents if we are doing classifier free guidance
                         latent_model_input = torch.cat([z_t] * 2) if do_classifier_free_guidance else z_t
                         latent_model_input = new_sd.scheduler.scale_model_input(latent_model_input, t)
@@ -1114,7 +1127,7 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                         new_sd.scheduler.alphas_cumprod = new_sd.scheduler.alphas_cumprod.to(device)
                         alpha_prod_t = new_sd.scheduler.alphas_cumprod[int(t)]
                         beta_prod_t = 1 - alpha_prod_t
-                        latents_0 = (z_t - beta_prod_t ** 0.5 * noise_pred) / ( alpha_prod_t ** 0.5)
+                        latents_0 = (z_t - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
 
                         needs_upcasting = new_sd.vae.dtype == torch.float16
                         if needs_upcasting:
@@ -1122,6 +1135,7 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                             latents_0 = latents_0.to(next(iter(new_sd.vae.post_quant_conv.parameters())).dtype)
                         
                         image_pred = new_sd.vae.decode(latents_0 / new_sd.vae.config.scaling_factor, return_dict=False)[0]
+                        # image_pred = image_pred.clamp(-1, 1)  # check SDXL decoder range
 
                         if needs_upcasting:
                             new_sd.vae.to(dtype=torch.float16)
@@ -1136,14 +1150,12 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                         inpainted_image = parallel_project + ortho_project
                         if needs_upcasting:
                             new_sd.upcast_vae()
+
                         # encoded_z_0 = self.model.encode_first_stage(inpainted_image) if ffhq256 else self.model.encode_first_stage(inpainted_image) 
-                        encoded_z_0 = new_sd.vae.encode(inpainted_image.to(torch.float32))["latent_dist"].mean 
+                        encoded_z_0 = new_sd.vae.encode(inpainted_image.to(torch.float32))["latent_dist"].mean * new_sd.vae.config.scaling_factor
                         if needs_upcasting:
                             new_sd.vae.to(dtype=torch.float16)
                             encoded_z_0 = encoded_z_0.to(dtype=torch.float16)
-                        
-                        if i > 40:
-                            encoded_z_0 = encoded_z_0 * new_sd.vae.config.scaling_factor
 
                         inpaint_error = torch.linalg.norm(latents_0 - encoded_z_0)
                         error = omega * meas_error + inpaint_error * gamma
@@ -1154,14 +1166,12 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                         gradients = torch.autograd.grad(error, inputs=z_t)[0]
                         if needs_upcasting:
                             new_sd.vae.to(dtype=torch.float16)
+
                         prev_latents[1:] = prev_latents[1:] - gradients.detach()
              
                 latents = prev_latents
 
                 with torch.no_grad():
-                    # step callback
-                    if p2p:
-                        latents = self.controller.step_callback(latents)
                     # call the callback, if provided
                     if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                         progress_bar.update()
@@ -1227,12 +1237,12 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         self.unet.set_attn_processor(attn_procs)
         controller.num_att_layers = cross_att_count
 
+
 def calculate_clip_score(images, prompts):
     # images_int = (images * 255).astype("uint8")
     images_int = images
     clip_score = clip_score_fn(torch.from_numpy(images_int).permute(2, 0, 1), prompts).detach()
     return round(float(clip_score), 4)
-
 
 ##################################################
 from processing.process_image import get_dataset, get_sample, parse_txt_objects 
@@ -1298,16 +1308,11 @@ def prompt_variation(obj, samples, label_path):
         prompt = [prompt[p] + new[p] for p in range(samples)]
     return prompt
 
-gamma = 0.1
-omega = 0.1
+gamma = 0.001
+omega = 0.001
 
 
 
-null_pipe = SDXLDDIMPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-xl-base-1.0",
-    torch_dtype=TYPE_,
-    use_safetensors=True,
-    ).to(device)
 
 # clean_image_path = '/work/08134/negin/frontera/outputs/text_guided/ffhq/samples/cat_glasses_box_inpainting0.05_omega0.05_gamma0.01_sim0.001/input/00000.png'
 # clean_image_path = f'./{category}.png'
@@ -1315,7 +1320,9 @@ null_pipe = SDXLDDIMPipeline.from_pretrained(
 pipe = Prompt2PromptPipeline.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0",
                                             torch_dtype=TYPE_, 
                                             use_safetensors=True).to(device)
-
+new_sd = copy.deepcopy(pipe)
+new_sd.scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False,
+                                  set_alpha_to_one=False)
 
 # Get images
 data_config = task_config["data"]
@@ -1325,7 +1332,7 @@ images = get_dataset(data_config['image_path'])
 clip_scores = []
 mses = []
 base_count = 0
-for image in images:
+for image in images[0:]:
     print(f'Grabbing {image}')
     img, label_path = get_sample(image, data_config)
     img = torch.tensor(img, device=device)
@@ -1352,6 +1359,8 @@ for image in images:
     )
 
     mask = mask_gen(label_path)
+    #change = torch.full_like(mask,0.2)
+    #torch.where(mask == 0, change, mask)
 
     ip_mask = mask
     print(mask.shape, org_image.shape)
@@ -1360,9 +1369,16 @@ for image in images:
     y_n = noiser(y)
     measurements=y_n
 
-    init_latents, _ = null_pipe(prompt=prompt, image = org_image)
+    null_pipe = SDXLDDIMPipeline.from_pretrained(
+        "stabilityai/stable-diffusion-xl-base-1.0",
+        #torch_dtype=TYPE_,
+        use_safetensors=True,
+        ).to(device)
 
-    prompts = [prompt] + prompt_variation(obj, 1, label_path)
+    init_latents, uncond_embeddings = null_pipe(prompt=prompt, image = org_image, num_inference_steps=50)
+    null_pipe=None
+
+    prompts = [prompt, prompt]
     print(prompts)
 
     n_cross_replace_words = set()
@@ -1373,21 +1389,23 @@ for image in images:
     n_cross_replace_words = n_cross_replace_words - set(prompts[0].split())
 
     for val in n_cross_replace_words:
-        n_cross_replace[val] = 0.4
+        n_cross_replace[val] = 0.5
 
-    n_cross_replace['default_'] = .6
+    n_cross_replace['default_'] = 1.
     print(n_cross_replace)
 
 
+    torch.cuda.empty_cache()
     cross_attention_kwargs = {"edit_type": "refine",
-                            "n_self_replace": .6,
-                            "n_cross_replace": {"default_": .6,},
+                            "n_self_replace": .1,
+                            "n_cross_replace": n_cross_replace,
                             #   "equalizer_words": [item,],
                             #   "equalizer_strengths": [7,],
                             }
 
     images = pipe(prompts, cross_attention_kwargs=cross_attention_kwargs, 
-                latents=init_latents,
+                uncond_emb=uncond_embeddings,
+                latents=init_latents.detach(),
                 measurements=measurements.to(TYPE_),
                 guidance_rescale=0.7,
                 operator=operator,
@@ -1396,14 +1414,14 @@ for image in images:
                 gamma=gamma,
                 omega=omega,
                 inpaint=True,
-                p2p=False)
+                p2p=True)
 
     print(f"Num images: {len(images['images'])}")
     samples = images['images']
 
     save_synthetic_samples_txt(samples, mask_gen.get_mask_info(), image, data_config, False, 'context')
 
-    # images['images'][1].save(f'./{category}_{item}_gamma_{gamma}_omega_{omega}.png')
+
 """
     clip_score_fn = partial(clip_score, model_name_or_path="openai/clip-vit-base-patch16")
     sd_clip_score = calculate_clip_score(np.array(image_rec), prompts[1])

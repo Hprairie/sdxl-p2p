@@ -14,10 +14,14 @@ from diffusers import (
     DDIMScheduler,
 )
 from tqdm import tqdm
+from torch.optim.adam import Adam
+
+
+
+GUIDANCE_SCALE = 7.5
 
 
 class SDXLDDIMPipeline(StableDiffusionXLImg2ImgPipeline):
-    @torch.no_grad()
     def get_noise_pred_single(self, latents, t, 
                                   encoder_hidden_states, 
                                   added_cond_kwargs):
@@ -26,7 +30,31 @@ class SDXLDDIMPipeline(StableDiffusionXLImg2ImgPipeline):
                                   added_cond_kwargs=added_cond_kwargs)["sample"]
         return noise_pred
 
-    @torch.no_grad()
+    def get_noise_pred(self, latents, t, is_forward=True, context=None, added_cond_kwargs=None):
+        latents_input = torch.cat([latents] * 2)
+        # if context is None:
+        #     context = self.context
+        guidance_scale = 1 if is_forward else GUIDANCE_SCALE
+        noise_pred = self.unet(latents_input, t, encoder_hidden_states=context,
+                                                 added_cond_kwargs=added_cond_kwargs)["sample"]
+        noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
+        if is_forward:
+            latents = self.next_step(noise_pred, t, latents)
+        else:
+            latents = self.prev_step(noise_pred, t, latents)
+        return latents
+
+    def prev_step(self, model_output: Union[torch.FloatTensor, np.ndarray], timestep: int, sample: Union[torch.FloatTensor, np.ndarray]):
+        prev_timestep = timestep - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
+        alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
+        alpha_prod_t_prev = self.scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.scheduler.final_alpha_cumprod
+        beta_prod_t = 1 - alpha_prod_t
+        pred_original_sample = (sample - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
+        pred_sample_direction = (1 - alpha_prod_t_prev) ** 0.5 * model_output
+        prev_sample = alpha_prod_t_prev ** 0.5 * pred_original_sample + pred_sample_direction
+        return prev_sample
+
     def next_step(self, model_output: Union[torch.FloatTensor, np.ndarray], timestep: int, sample: Union[torch.FloatTensor, np.ndarray]):
         timestep, next_timestep = min(timestep - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps, 999), timestep
         alpha_prod_t = self.scheduler.alphas_cumprod[timestep] if timestep >= 0 else self.scheduler.final_alpha_cumprod
@@ -37,7 +65,47 @@ class SDXLDDIMPipeline(StableDiffusionXLImg2ImgPipeline):
         next_sample = alpha_prod_t_next ** 0.5 * next_original_sample + next_sample_direction
         return next_sample
 
-    @torch.no_grad()
+    def null_optimization(self, latents, num_inference_steps, epsilon, negative_prompt_embeds, prompt_embeds, added_cond_kwargs):
+        uncond_embeddings = torch.zeros_like(negative_prompt_embeds)
+        cond_embeddings = prompt_embeds
+        uncond_embeddings_list = []
+        latent_cur = latents[-1]
+        num_inner_steps = 2
+        bar = tqdm(total=num_inner_steps * num_inference_steps)
+        for i in range(num_inference_steps):
+            uncond_embeddings = uncond_embeddings.clone().detach()
+            uncond_embeddings.requires_grad = True
+            optimizer = Adam([uncond_embeddings], lr=1e-2 * (1. - i / 100.))
+            latent_prev = latents[len(latents) - i - 2]
+            t = self.scheduler.timesteps[i]
+
+            with torch.no_grad():
+                noise_pred_cond = self.get_noise_pred_single(latent_cur, t, cond_embeddings, added_cond_kwargs)
+            for j in range(num_inner_steps):
+                noise_pred_uncond = self.get_noise_pred_single(latent_cur, t, uncond_embeddings, added_cond_kwargs)
+                noise_pred = noise_pred_uncond + GUIDANCE_SCALE * (noise_pred_cond - noise_pred_uncond)
+                latents_prev_rec = self.prev_step(noise_pred, t, latent_cur)
+                
+                loss = F.mse_loss(latents_prev_rec, latent_prev)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                loss_item = loss.item()
+                bar.update()
+          
+
+                if loss_item < epsilon + i * 2e-5:
+                    break
+            for j in range(j + 1, num_inner_steps):
+                bar.update()
+            uncond_embeddings_list.append(uncond_embeddings[:1].detach())
+            with torch.no_grad():
+                context = torch.cat([uncond_embeddings, cond_embeddings], dim=0)
+                latent_cur = self.get_noise_pred(latent_cur, t, False, context, added_cond_kwargs)
+        bar.close()
+
+        return uncond_embeddings_list
+    
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
@@ -207,22 +275,25 @@ class SDXLDDIMPipeline(StableDiffusionXLImg2ImgPipeline):
             added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
             prev_timestep = None
 
-            all_latent = [latents]
-            latent = latents.clone().detach()
+            with torch.no_grad():
+                all_latent = [latents]
+                latent = latents.clone().detach()
 
-            for i in range(num_inference_steps):
-                latent_model_input = latents
-                t = self.scheduler.timesteps[len(self.scheduler.timesteps) - i - 1]
-                noise_pred = self.get_noise_pred_single(latent_model_input, t, 
-                                  encoder_hidden_states=prompt_embeds,  
-                                  added_cond_kwargs=added_cond_kwargs)
+                for i in range(num_inference_steps):
+                    latent_model_input = latents
+                    t = self.scheduler.timesteps[len(self.scheduler.timesteps) - i - 1]
+                    noise_pred = self.get_noise_pred_single(latent_model_input, t, 
+                                    encoder_hidden_states=prompt_embeds,  
+                                    added_cond_kwargs=added_cond_kwargs)
 
-                latents = self.next_step(noise_pred, t, latents)
-                all_latent.append(latents)
+                    latents = self.next_step(noise_pred, t, latents)
+                    all_latent.append(latents)
             
             ddim_latents = all_latent
 
-        # uncond_embeddings = self.null_optimization(ddim_latents, num_inner_steps, early_stop_epsilon, prompt_embeds, negative_prompt_embeds, cross_attention_kwargs, added_cond_kwargs)
-        return ddim_latents, None #uncond_embeddings
+        early_stop_epsilon = 1e-6
+        uncond_embeddings = self.null_optimization(ddim_latents, num_inference_steps, early_stop_epsilon, negative_prompt_embeds, prompt_embeds, added_cond_kwargs)
+        torch.cuda.empty_cache() 
+        return ddim_latents[-1].to(torch.float16), uncond_embeddings
         # return StableDiffusionXLPipelineOutput(images=ddim_latents)
    
